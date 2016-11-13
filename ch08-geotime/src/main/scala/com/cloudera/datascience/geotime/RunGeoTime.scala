@@ -6,68 +6,61 @@
 
 package com.cloudera.datascience.geotime
 
-
+import java.sql.Timestamp
 import java.text.SimpleDateFormat
 import java.util.Locale
 
 import scala.collection.mutable.ArrayBuffer
 import scala.reflect.ClassTag
 
-import org.apache.spark.{HashPartitioner, Partitioner, SparkConf, SparkContext}
-import org.apache.spark.SparkContext._
-import org.apache.spark.rdd.RDD
-import org.apache.spark.util.StatCounter
+import org.apache.spark.sql.{DataFrame, Dataset, SparkSession}
+import org.apache.spark.sql.SparkSession._
+import org.apache.spark.sql.functions._
+import org.apache.spark.sql.catalyst.util.{ArrayData, GenericArrayData}
+import org.apache.spark.sql.types._
+
+import org.joda.time.Duration
 
 import com.esri.core.geometry.Point
-import org.joda.time.{DateTime, Duration}
 import spray.json._
 
 import com.cloudera.datascience.geotime.GeoJsonProtocol._
 
 case class Trip(
-  pickupTime: DateTime,
-  dropoffTime: DateTime,
-  pickupLoc: Point,
-  dropoffLoc: Point)
+  license: String,
+  pickupTime: Long,
+  dropoffTime: Long,
+  pickupX: Double,
+  pickupY: Double,
+  dropoffX: Double,
+  dropoffY: Double)
 
 object RunGeoTime extends Serializable {
 
   val formatter = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.ENGLISH)
 
   def main(args: Array[String]): Unit = {
-    val sc = new SparkContext(new SparkConf().setAppName("GeoTime"))
-    val taxiRaw = sc.textFile("taxidata")
+    val spark = SparkSession.builder().getOrCreate()
+    import spark.implicits._
 
-    val safeParse = safe(parse)
-    val taxiParsed = taxiRaw.map(safeParse)
-    taxiParsed.cache()
+    val taxiRaw = spark.read.textFile("taxidata")
 
-    val taxiBad = taxiParsed.collect({
-      case t if t.isRight => t.right.get
-    })
-    taxiBad.collect().foreach(println)
-
-    val taxiGood = taxiParsed.collect({
-      case t if t.isLeft => t.left.get
-    })
+    // TODO: CSV parsing and filtering
+    val taxiGood = taxiRaw.map(parse)
     taxiGood.cache()
 
-    def hours(trip: Trip): Long = {
-      val d = new Duration(trip.pickupTime, trip.dropoffTime)
+    val hours = (pickup: Long, dropoff: Long) => {
+      val d = new Duration(pickup, dropoff)
       d.getStandardHours
     }
+    val hoursUDF = udf(hours)
 
-    taxiGood.values.map(hours).countByValue().toList.sorted.foreach(println)
-    taxiParsed.unpersist()
+    taxiGood.groupBy(hoursUDF('pickupTime, 'dropoffTime)).count().show()
 
-    val taxiClean = taxiGood.filter {
-      case (lic, trip) => {
-        val hrs = hours(trip)
-        0 <= hrs && hrs < 3
-      }
-    }
+    // TODO: add in 3 hour filter again
+    val taxiClean = taxiGood.filter(hoursUDF('pickupTime, 'dropoffTime) > 0)
 
-    val geojson = scala.io.Source.fromURL(getClass.getResource("/nyc-boroughs.geojson")).mkString
+    val geojson = scala.io.Source.fromURL(this.getClass.getResource("/nyc-boroughs.geojson")).mkString
 
     val features = geojson.parseJson.convertTo[FeatureCollection]
     val areaSortedFeatures = features.sortBy(f => {
@@ -75,137 +68,58 @@ object RunGeoTime extends Serializable {
       (borough, -f.geometry.area2D())
     })
 
-    val bFeatures = sc.broadcast(areaSortedFeatures)
+    val bFeatures = spark.sparkContext.broadcast(areaSortedFeatures)
 
-    def borough(trip: Trip): Option[String] = {
+    val borough = (x: Double, y: Double) => {
       val feature: Option[Feature] = bFeatures.value.find(f => {
-        f.geometry.contains(trip.dropoffLoc)
+        f.geometry.contains(new Point(x, y))
       })
       feature.map(f => {
         f("borough").convertTo[String]
-      })
+      }).getOrElse("NA")
     }
+    val boroughUDF = udf(borough)
 
-    taxiClean.values.map(borough).countByValue().foreach(println)
+    taxiClean.groupBy(boroughUDF('dropoffX, 'dropoffY)).count().show()
+    val taxiDone = taxiClean.filter("dropoff_x != 0 and dropoff_y != 0 and pickup_x != 0 and pickup_y != 0")
+    taxiDone.groupBy(boroughUDF('dropoffX, 'dropoffY)).count().show()
 
-    def hasZero(trip: Trip): Boolean = {
-      val zero = new Point(0.0, 0.0)
-      (zero.equals(trip.pickupLoc) || zero.equals(trip.dropoffLoc))
-    }
-
-    val taxiDone = taxiClean.filter {
-      case (lic, trip) => !hasZero(trip)
-    }.cache()
-
-    taxiDone.values.map(borough).countByValue().foreach(println)
     taxiGood.unpersist()
 
-    def secondaryKeyFunc(trip: Trip) = trip.pickupTime.getMillis
-    val sessions = groupByKeyAndSortValues(taxiDone, secondaryKeyFunc, split)
+    val sessions = taxiDone.repartition('license).sortWithinPartitions('license, 'pickupTime)
 
-    def boroughDuration(t1: Trip, t2: Trip): (Option[String], Duration) = {
-      val b = borough(t1)
+    def boroughDuration(t1: Trip, t2: Trip): (String, Long) = {
+      val b = borough(t1.dropoffX, t1.dropoffY)
       val d = new Duration(t1.dropoffTime, t2.pickupTime)
-      (b, d)
+      (b, d.getStandardSeconds)
     }
 
-    val boroughDurations: RDD[(Option[String], Duration)] =
-      sessions.values.flatMap(trips => {
+    val boroughDurations: DataFrame =
+      sessions.mapPartitions(trips => {
         val iter: Iterator[Seq[Trip]] = trips.sliding(2)
         val viter = iter.filter(_.size == 2)
         viter.map(p => boroughDuration(p(0), p(1)))
-      }).cache()
+      }).toDF("borough", "seconds")
 
-    boroughDurations.values.map(_.getStandardHours).countByValue().toList.sorted.foreach(println)
+    boroughDurations.select("seconds / 60 as hours").describe("hours").show()
     taxiDone.unpersist()
 
-    boroughDurations.filter {
-      case (b, d) => d.getMillis >= 0
-    }.mapValues(d => {
-      val s = new StatCounter()
-      s.merge(d.getStandardSeconds)
-    }).
-    reduceByKey((a, b) => a.merge(b)).collect().foreach(println)
+    boroughDurations.where("seconds > 0").groupBy("borough").agg(sum("seconds")).show()
 
     boroughDurations.unpersist()
   }
 
-  def point(longitude: String, latitude: String): Point = {
-    new Point(longitude.toDouble, latitude.toDouble)
-  }
-
-  def parse(line: String): (String, Trip) = {
+  def parse(line: String): Trip = {
     val fields = line.split(',')
     val license = fields(1)
     // Not thread-safe:
     val formatterCopy = formatter.clone().asInstanceOf[SimpleDateFormat]
-    val pickupTime = new DateTime(formatterCopy.parse(fields(5)))
-    val dropoffTime = new DateTime(formatterCopy.parse(fields(6)))
-    val pickupLoc = point(fields(10), fields(11))
-    val dropoffLoc = point(fields(12), fields(13))
-
-    val trip = Trip(pickupTime, dropoffTime, pickupLoc, dropoffLoc)
-    (license, trip)
-  }
-
-  def safe[S, T](f: S => T): S => Either[T, (S, Exception)] = {
-    new Function[S, Either[T, (S, Exception)]] with Serializable {
-      def apply(s: S): Either[T, (S, Exception)] = {
-        try {
-          Left(f(s))
-        } catch {
-          case e: Exception => Right((s, e))
-        }
-      }
-    }
-  }
-
-  def split(t1: Trip, t2: Trip): Boolean = {
-    val p1 = t1.pickupTime
-    val p2 = t2.pickupTime
-    val d = new Duration(p1, p2)
-    d.getStandardHours >= 4
-  }
-
-  def groupByKeyAndSortValues[K : Ordering : ClassTag, V : ClassTag, S : Ordering](
-      rdd: RDD[(K, V)],
-      secondaryKeyFunc: (V) => S,
-      splitFunc: (V, V) => Boolean): RDD[(K, List[V])] = {
-    val presess = rdd.map {
-      case (lic, trip) => {
-        ((lic, secondaryKeyFunc(trip)), trip)
-      }
-    }
-    val partitioner = new FirstKeyPartitioner[K, S](presess.partitions.length)
-    presess.repartitionAndSortWithinPartitions(partitioner).mapPartitions(groupSorted(_, splitFunc))
-  }
-
-  def groupSorted[K, V, S](
-      it: Iterator[((K, S), V)],
-      splitFunc: (V, V) => Boolean): Iterator[(K, List[V])] = {
-    var curLic: K = null.asInstanceOf[K]
-    val curTrips = ArrayBuffer[V]()
-    it.flatMap { case ((lic, _), trip) =>
-      if (!lic.equals(curLic) || splitFunc(curTrips.last, trip)) {
-        val result = (curLic, List(curTrips:_*))
-        curLic = lic
-        curTrips.clear()
-        curTrips += trip
-        if (result._2.isEmpty) None else Some(result)
-      } else {
-        curTrips += trip
-        None
-      }
-    } ++ Iterator((curLic, List(curTrips:_*)))
+    val pickupTime = formatterCopy.parse(fields(5)).getTime()
+    val dropoffTime = formatterCopy.parse(fields(6)).getTime()
+    val pickupX = fields(10).toDouble
+    val pickupY = fields(11).toDouble
+    val dropoffX = fields(12).toDouble
+    val dropoffY = fields(13).toDouble
+    Trip(license, pickupTime, dropoffTime, pickupX, pickupY, dropoffX, dropoffY)
   }
 }
-
-class FirstKeyPartitioner[K1, K2](partitions: Int) extends Partitioner {
-  val delegate = new HashPartitioner(partitions)
-  override def numPartitions = delegate.numPartitions
-  override def getPartition(key: Any): Int = {
-    val k = key.asInstanceOf[(K1, K2)]
-    delegate.getPartition(k._1)
-  }
-}
-
